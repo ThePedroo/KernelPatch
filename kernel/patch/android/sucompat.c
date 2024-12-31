@@ -45,8 +45,91 @@ static const char legacy_su_path[] = ANDROID_LEGACY_SU_PATH;
 static const char *current_su_path = 0;
 static const char apd_path[] = APD_PATH;
 
-static struct list_head allow_uid_list;
-static spinlock_t list_lock;
+static struct allow_uid *allow_list_ht = NULL;
+static const int allow_list_ht_size = 64;
+static int allow_list_ht_length = 0;
+
+void _allow_list_init() {
+    allow_list_ht = vmalloc(allow_list_ht_size * sizeof(struct allow_uid));
+    if (!allow_list_ht) {
+        logke("allow_list_ht vmalloc error\n");
+
+        return;
+    }
+
+    for (int i = 0; i < allow_list_ht_size; i++) {
+        allow_list_ht[i].uid = 0;
+    }
+}
+
+void _allow_list_free() {
+    if (!allow_list_ht) return;
+
+    kvfree(allow_list_ht);
+    allow_list_ht = NULL;
+}
+
+int _allow_list_add(struct allow_uid *allow) {
+    if (!allow_list_ht) {
+        logke("allow_list_ht not initialized\n");
+
+        return -EINVAL;
+    }
+
+    int idx = allow->uid % allow_list_ht_size;
+    
+    while (idx < allow_list_ht_size) {
+        if (allow_list_ht[idx].uid == 0) {
+            memcpy(&allow_list_ht[idx], allow, sizeof(struct allow_uid));
+            allow_list_ht_length++;
+
+            return 0;
+        }
+
+        idx++;
+    }
+}
+
+int _allow_list_remove(uid_t uid) {
+    if (!allow_list_ht) {
+        logke("allow_list_ht not initialized\n");
+
+        return -EINVAL;
+    }
+
+    int idx = uid % allow_list_ht_size;
+    
+    while (idx < allow_list_ht_size) {
+        if (allow_list_ht[idx].uid == uid) {
+            memset(&allow_list_ht[idx], 0, sizeof(struct allow_uid));
+            allow_list_ht_length--;
+
+            return 0;
+        }
+
+        idx++;
+    }
+}
+
+struct allow_uid *_allow_list_check(uid_t uid) {
+    if (!allow_list_ht) {
+        logke("allow_list_ht not initialized\n");
+
+        return -EINVAL;
+    }
+
+    int idx = uid % allow_list_ht_size;
+    
+    while (idx < allow_list_ht_size) {
+        if (allow_list_ht[idx].uid == uid) {
+            return &allow_list_ht[idx];
+        }
+
+        idx++;
+    }
+
+    return NULL;
+}
 
 static void allow_reclaim_callback(struct rcu_head *rcu)
 {
@@ -59,15 +142,14 @@ struct su_profile profile_su_allow_uid(uid_t uid)
     rcu_read_lock();
     struct allow_uid *pos;
     struct su_profile profile = { 0 };
-    list_for_each_entry_rcu(pos, &allow_uid_list, list)
-    {
-        if (pos->uid == uid) {
-            memcpy(&profile, &pos->profile, sizeof(struct su_profile));
-            rcu_read_unlock();
-            return profile;
-        }
+
+    struct allow_strct *pos = _allow_list_check(uid);
+    if (pos) {
+        memcpy(&profile, &pos->profile, sizeof(struct su_profile));
+
+        return profile;
     }
-    rcu_read_unlock();
+
     return profile;
 }
 KP_EXPORT_SYMBOL(profile_su_allow_uid);
@@ -75,142 +157,81 @@ KP_EXPORT_SYMBOL(profile_su_allow_uid);
 int is_su_allow_uid(uid_t uid)
 {
     rcu_read_lock();
-    struct allow_uid *pos;
-    list_for_each_entry_rcu(pos, &allow_uid_list, list)
-    {
-        if (pos->uid == uid) {
-            rcu_read_unlock();
-            return 1;
-        }
-    }
-    rcu_read_unlock();
-    return 0;
+
+    struct allow_strct *pos = _allow_list_check(uid);
+
+    return pos != NULL;
 }
 KP_EXPORT_SYMBOL(is_su_allow_uid);
 
 int su_add_allow_uid(uid_t uid, struct su_profile *profile, int async)
 {
-    rcu_read_lock();
-    struct allow_uid *pos, *old = 0;
-    list_for_each_entry(pos, &allow_uid_list, list)
-    {
-        if (pos->uid == uid) {
-            old = pos;
-            break;
-        }
-    }
     struct allow_uid *new = (struct allow_uid *)vmalloc(sizeof(struct allow_uid));
     new->uid = profile->uid;
     memcpy(&new->profile, profile, sizeof(struct su_profile));
     new->profile.scontext[sizeof(new->profile.scontext) - 1] = '\0';
 
-    spin_lock(&list_lock);
-    if (old) { // update
-        list_replace_rcu(&old->list, &new->list);
-        logkfi("update uid: %d, to_uid: %d, sctx: %s\n", uid, new->profile.to_uid, new->profile.scontext);
-    } else { // add new one
-        list_add_rcu(&new->list, &allow_uid_list);
-        logkfi("new uid: %d, to_uid: %d, sctx: %s\n", uid, new->profile.to_uid, new->profile.scontext);
-    }
-    spin_unlock(&list_lock);
+    _allow_list_add(new);
 
-    rcu_read_unlock();
-    if (old) {
-        if (async) {
-            call_rcu(&old->rcu, allow_reclaim_callback);
-        } else {
-            synchronize_rcu();
-            kvfree(old);
-        }
-    }
     return 0;
 }
 
 int su_remove_allow_uid(uid_t uid, int async)
 {
-    struct allow_uid *pos;
-    spin_lock(&list_lock);
-    list_for_each_entry(pos, &allow_uid_list, list)
-    {
-        if (pos->uid == uid) {
-            list_del_rcu(&pos->list);
-            spin_unlock(&list_lock);
-            logkfi("uid: %d, to_uid: %d, sctx: %s\n", pos->uid, pos->profile.to_uid, pos->profile.scontext);
-            if (async) {
-                call_rcu(&pos->rcu, allow_reclaim_callback);
-            } else {
-                synchronize_rcu();
-                kvfree(pos);
-            }
-            return 0;
-        }
-    }
-    spin_unlock(&list_lock);
+    (void)async;
+
+    _allow_list_remove(uid);
+
     return 0;
 }
 
 int su_allow_uid_nums()
 {
-    int num = 0;
-    rcu_read_lock();
-    struct allow_uid *pos;
-    list_for_each_entry(pos, &allow_uid_list, list)
-    {
-        num++;
-    }
-    rcu_read_unlock();
-    logkfd("%d\n", num);
-    return num;
+    logkfd("%d\n", allow_list_ht_length);
+
+    return allow_list_ht_length;
 }
 
 int su_allow_uids(uid_t *__user uuids, int unum)
 {
-    int rc = 0;
-    int num = 0;
-    rcu_read_lock();
-    struct allow_uid *pos;
-    list_for_each_entry(pos, &allow_uid_list, list)
-    {
-        if (num >= unum) {
-            goto out;
+    int uuid_i = 0;
+ 
+    for (int i = 0; i < allow_list_ht_size; i++) {
+        if (allow_list_ht[i].uid == 0) continue;
+
+        if (uuid_i >= unum) {
+            break;
         }
-        uid_t uid = pos->profile.uid;
-        int cplen = compat_copy_to_user(uuids + num, &uid, sizeof(uid));
-        logkfd("uid: %d\n", uid);
+
+        int cplen = compat_copy_to_user(uuids + uuid_i, &allow_list_ht[i].uid, sizeof(uid_t));
         if (cplen <= 0) {
             logkfd("compat_copy_to_user error: %d", cplen);
-            rc = cplen;
-            goto out;
+
+            return cplen;
         }
-        num++;
+
+        uuid_i++;
     }
-    rc = num;
-out:
-    rcu_read_unlock();
-    return rc;
+
+    return uuid_i;
 }
 
 int su_allow_uid_profile(uid_t uid, struct su_profile *__user uprofile)
 {
-    int rc = -ENOENT;
-    rcu_read_lock();
-    struct allow_uid *pos;
-    list_for_each_entry(pos, &allow_uid_list, list)
-    {
-        if (pos->profile.uid != uid) continue;
-        int cplen = compat_copy_to_user(uprofile, &pos->profile, sizeof(struct su_profile));
-        logkfd("profile: %d %d %s\n", uid, pos->profile.to_uid, pos->profile.scontext);
-        if (cplen <= 0) {
-            logkfd("compat_copy_to_user error: %d", cplen);
-            rc = cplen;
-            goto out;
-        }
-        rc = 0;
-        goto out;
+
+    struct allow_uid *pos = _allow_list_check(uid);
+    if (!pos) {
+        return -ENOENT;
     }
-out:
-    rcu_read_unlock();
-    return rc;
+
+    int cplen = compat_copy_to_user(uprofile, &pos->profile, sizeof(struct su_profile));
+    if (cplen <= 0) {
+        logkfd("compat_copy_to_user error: %d", cplen);
+
+        return cplen;
+    }
+
+    return 0;
 }
 
 // no free, no lock
@@ -649,8 +670,7 @@ int su_compat_init()
 {
     current_su_path = default_su_path;
 
-    INIT_LIST_HEAD(&allow_uid_list);
-    spin_lock_init(&list_lock);
+    _allow_list_init();
 
     // default shell
     struct su_profile default_allow_profile = {
