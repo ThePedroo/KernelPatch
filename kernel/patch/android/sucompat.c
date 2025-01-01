@@ -88,6 +88,8 @@ int _allow_list_add(struct allow_uid *allow) {
 
         idx++;
     }
+
+    return -ENOMEM;
 }
 
 int _allow_list_remove(uid_t uid) {
@@ -109,13 +111,15 @@ int _allow_list_remove(uid_t uid) {
 
         idx++;
     }
+
+    return -ENOENT;
 }
 
 struct allow_uid *_allow_list_check(uid_t uid) {
     if (!allow_list_ht) {
         logke("allow_list_ht not initialized\n");
 
-        return -EINVAL;
+        return NULL;
     }
 
     int idx = uid % allow_list_ht_size;
@@ -131,19 +135,12 @@ struct allow_uid *_allow_list_check(uid_t uid) {
     return NULL;
 }
 
-static void allow_reclaim_callback(struct rcu_head *rcu)
-{
-    struct allow_uid *allow = container_of(rcu, struct allow_uid, rcu);
-    kvfree(allow);
-}
-
 struct su_profile profile_su_allow_uid(uid_t uid)
 {
     rcu_read_lock();
-    struct allow_uid *pos;
     struct su_profile profile = { 0 };
 
-    struct allow_strct *pos = _allow_list_check(uid);
+    struct allow_uid *pos = _allow_list_check(uid);
     if (pos) {
         memcpy(&profile, &pos->profile, sizeof(struct su_profile));
 
@@ -158,7 +155,7 @@ int is_su_allow_uid(uid_t uid)
 {
     rcu_read_lock();
 
-    struct allow_strct *pos = _allow_list_check(uid);
+    struct allow_uid *pos = _allow_list_check(uid);
 
     return pos != NULL;
 }
